@@ -690,21 +690,21 @@ static int main_loop(int argc, const char **argv_) {
   const char *outfile_pattern = NULL;
   char outfile_name[PATH_MAX] = { 0 };
 
-  // In case of single stream, `outfile` is the output file where output video /
-  // MD5 is stored.
-  // In case of multi-stream:
-  // - `outfile_substream[i]` is the output file where output video / MD5 of
+  // `outfile` is used only when !noblit && single_file && !do_md5 is true.
+  // - In case of single stream (num_streams == 1), `outfile` is the output
+  //   file where output video is stored.
+  // - In case of multi-stream (num_streams > 1), `outfile` is a pointer to
+  //   output file of current stream `outfile_substream[i]`.
+  //
+  // `outfile_substream[i]` is opened only when !noblit && single_file &&
+  // num_streams > 1 is true. It is the output file where output video / MD5 of
   // i'th stream is stored.
-  // - `outfile` is either (a) a pointer to output file of current stream
-  // `outfile_substream[i]`, in case of video output or (b) output file where
-  // the overall multistream MD5 is stored.
-  // This implementation approach is for two reasons:
-  // 1. In case of video output, there is no "combined" multistream output, so
+  //
+  // This implementation approach is for the following reason:
+  // In case of video output, there is no "combined" multistream output, so
   // `outfile` is repurposed to point to current output file. That way, all the
   // video output related code can unconditionally use `outfile` for
   // single/multistream cases.
-  // 2. In case of MD5 output, there is a "combined" multistream output, so
-  // `outfile` is used for this combined output file.
   FILE *outfile = NULL;
   FILE *outfile_substream[AVM_MAX_NUM_STREAMS] = { NULL };
 
