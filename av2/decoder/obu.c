@@ -1320,7 +1320,8 @@ static size_t read_metadata_unit_header(AV2Decoder *pbi, const uint8_t *data,
   AV2_COMMON *const cm = &pbi->common;
   size_t type_length;
   uint64_t type_value;
-  if (avm_uleb_decode(data, sz, &type_value, &type_length) < 0) {
+  if (avm_uleb_decode(data, sz, &type_value, &type_length) < 0 ||
+      type_value > UINT32_MAX) {
     cm->error.error_code = AVM_CODEC_CORRUPT_FRAME;
     return 0;
   }
@@ -1336,12 +1337,15 @@ static size_t read_metadata_unit_header(AV2Decoder *pbi, const uint8_t *data,
   bytes_read += avm_rb_bytes_read(&rb);
 
   const size_t total_size = bytes_read + muh_header_size;
-  assert(total_size <= sz);
+  if (total_size > sz) {
+    cm->error.error_code = AVM_CODEC_CORRUPT_FRAME;
+    return 0;
+  }
 
   if (!metadata->cancel_flag) {
     size_t size_length;
     uint64_t size_value = 0;
-    if (avm_uleb_decode(data + bytes_read, sz - bytes_read, &size_value,
+    if (avm_uleb_decode(data + bytes_read, total_size - bytes_read, &size_value,
                         &size_length) < 0) {
       cm->error.error_code = AVM_CODEC_CORRUPT_FRAME;
       return 0;
@@ -1349,7 +1353,7 @@ static size_t read_metadata_unit_header(AV2Decoder *pbi, const uint8_t *data,
     metadata->sz = size_value;
     bytes_read += size_length;
 
-    av2_init_read_bit_buffer(pbi, &rb, data + bytes_read, data + sz);
+    av2_init_read_bit_buffer(pbi, &rb, data + bytes_read, data + total_size);
 
     metadata->layer_idc = (avm_metadata_layer_t)avm_rb_read_literal(&rb, 3);
     metadata->persistence_idc =
@@ -1362,7 +1366,10 @@ static size_t read_metadata_unit_header(AV2Decoder *pbi, const uint8_t *data,
     if (metadata->layer_idc == AVM_LAYER_VALUES) {
       if (obu_header->obu_xlayer_id == 31) {
         metadata->xlayer_map = avm_rb_read_unsigned_literal(&rb, 32);
-        assert((metadata->xlayer_map & (1u << 31)) == 0);
+        if ((metadata->xlayer_map & (1u << 31)) != 0) {
+          cm->error.error_code = AVM_CODEC_CORRUPT_FRAME;
+          return 0;
+        }
         for (int n = 0; n < 31; n++) {
           if (metadata->xlayer_map & (1u << n)) {
             metadata->mlayer_map[n] = avm_rb_read_unsigned_literal(&rb, 8);
