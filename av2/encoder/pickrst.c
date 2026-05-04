@@ -2049,6 +2049,7 @@ static void gather_stats_wienerns(const RestorationTileLimits *limits,
   rui.cm = rsc->cm;
   // Calculate and save this RU's stats.
   RstUnitStats unit_stats;
+  memset(&unit_stats, 0, sizeof(unit_stats));
   RestUnitSearchInfo *rusi = &rsc->rusi[rest_unit_idx];
   unit_stats.real_sse = 0;
   if (!rusi->bru_unit_skipped) {
