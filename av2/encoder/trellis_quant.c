@@ -395,8 +395,15 @@ void av2_pre_quant_c(tran_low_t tqc, struct prequant_t *pqData,
   tran_low_t add = -((2 << shift) >> 1);
   tran_low_t abs_tqc = abs(tqc);
 
+  // FIX: cap qIdx to (1<<15) - 1 = 32767 = INT16_MAX, not (1<<16) - 1 = 65535.
+  // pqData->qIdx is declared int16_t; the old (1<<16)-1 cap allowed values up
+  // to 65535 which then get sign-truncated to negative when written into the
+  // int16_t field. Downstream code reads pq->qIdx back, sees a hugely
+  // negative value, and dereferences cost_low_tbl[idx≈-32766][...] —
+  // many MB before the array → SIGSEGV on simcloud (Waterfall/ParkJoy/
+  // NocturneDance qp=-41/qp=-16 4K 4:2:2 12-bit).
   tran_low_t qIdx = (int)AVMMAX(
-      1, AVMMIN(((1 << 16) - 1),
+      1, AVMMIN(((1 << 15) - 1),
                 ((int64_t)abs_tqc * quant_ptr[scan_pos != 0] + add) >> shift));
   pqData->qIdx = qIdx;
 
@@ -658,6 +665,16 @@ void av2_get_rate_dist_lf_luma_c(const struct tcq_param_t *p,
     int base_ctx =
         get_base_diag_ctx(diag_ctx) + get_base_ctx(coeff_ctx->coef[i]);
     int mid_ctx = get_mid_diag_ctx(diag_ctx) + get_mid_ctx(coeff_ctx->coef[i]);
+    // Saturate combined contexts to avoid out-of-bounds reads.
+    // base_diag_ctx ∈ [0, 32] and get_base_ctx(...) ∈ [0, 15] can combine to
+    // 47, exceeding LF_SIG_COEF_CONTEXTS = 33. The AVX2 specialization
+    // uses 8-byte SIMD loads at &cost_low_tbl[idx][ctx][1] which read 4
+    // bytes of [ctx][1] plus 4 spillover bytes from [ctx+1][0]; that load
+    // requires ctx + 1 < LF_SIG_COEF_CONTEXTS i.e. ctx <=
+    // LF_SIG_COEF_CONTEXTS - 2. We use the same clamp here so both paths
+    // remain bit-exact. Same logic for mid_ctx vs LF_LEVEL_CONTEXTS.
+    if (base_ctx > LF_SIG_COEF_CONTEXTS - 2) base_ctx = LF_SIG_COEF_CONTEXTS - 2;
+    if (mid_ctx  > LF_LEVEL_CONTEXTS  - 2) mid_ctx  = LF_LEVEL_CONTEXTS  - 2;
     int cost0 = get_coeff_cost(blk_pos, absLevel[a0], coeff_sign, base_ctx,
                                mid_ctx, dc_sign_ctx, txb_costs, bwl, tx_class,
                                tmp_sign, plane, 1, q_i);

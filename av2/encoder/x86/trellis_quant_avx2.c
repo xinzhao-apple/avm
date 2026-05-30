@@ -199,8 +199,13 @@ void av2_pre_quant_avx2(tran_low_t tqc, struct prequant_t *pqData,
   int32_t add = -((2 << shift) >> 1);
   int32_t abs_tqc = abs(tqc);
 
+  // FIX: cap qIdx to (1<<15) - 1 = INT16_MAX. pqData->qIdx is int16_t; the
+  // previous (1<<16)-1 cap allowed up to 65535, which truncates to negative
+  // when written into int16_t. Downstream code (av2_get_rate_dist_lf_luma_*)
+  // reads pq->qIdx, gets a hugely negative value, and dereferences
+  // cost_low_tbl[idx≈-32766][...] → unmapped memory → SIGSEGV on simcloud.
   int32_t qIdx = (int)AVMMAX(
-      1, AVMMIN(((1 << 16) - 1),
+      1, AVMMIN(((1 << 15) - 1),
                 ((int64_t)abs_tqc * quant_ptr[scan_pos != 0] + add) >> shift));
   pqData->qIdx = qIdx;
 
@@ -625,6 +630,13 @@ void av2_get_rate_dist_lf_luma_avx2(const struct tcq_param_t *p,
   int mid_diag_ctx = get_mid_diag_ctx(diag_ctx);
 
   // Calc zero coeff costs.
+  // FIX (over-bound base_ctx): base_diag_ctx in [0, LF_SIG_COEF_CONTEXTS-1]
+  // and per-state (coef & 0xF) in [0, 15] can combine to exceed
+  // LF_SIG_COEF_CONTEXTS-1. The C reference clamps base_ctx; mirror that
+  // here by clamping the shuffle position so each lane reads at most
+  // cost_zero[i][LF_SIG_COEF_CONTEXTS-1]. The 32-byte cost_zero loads
+  // themselves stay within mapped struct memory for any base_diag_ctx, so
+  // no load-side change is needed.
   __m256i cost_zero_dq0 =
       _mm256_lddqu_si256((__m256i *)&cost_zero[0][base_diag_ctx]);
   __m256i cost_zero_dq1 =
@@ -637,7 +649,19 @@ void av2_get_rate_dist_lf_luma_avx2(const struct tcq_param_t *p,
   __m256i ctx = _mm256_castsi128_si256(_mm_loadu_si64(&coeff_ctx->coef));
   __m256i fifteen = _mm256_set1_epi8(15);
   __m256i base_ctx = _mm256_and_si256(ctx, fifteen);
-  __m256i base_ctx1 = _mm256_permute4x64_epi64(base_ctx, 0);
+  // Max valid in-row position for the cost_zero shuffle is
+  //   (LF_SIG_COEF_CONTEXTS - 2) - base_diag_ctx
+  // (clamped to [0, 15]). Using -2 not -1 so the resulting clamped index
+  // matches the -2 clamp applied in the cost_low_tbl loop below and in
+  // av2_get_rate_dist_lf_luma_c, keeping the C and AVX2 paths bit-exact.
+  int zero_shuf_max_scalar =
+      (LF_SIG_COEF_CONTEXTS - 2) - base_diag_ctx;
+  if (zero_shuf_max_scalar < 0) zero_shuf_max_scalar = 0;
+  if (zero_shuf_max_scalar > 15) zero_shuf_max_scalar = 15;
+  __m256i zero_shuf_max =
+      _mm256_set1_epi8((int8_t)zero_shuf_max_scalar);
+  __m256i base_ctx_zero = _mm256_min_epu8(base_ctx, zero_shuf_max);
+  __m256i base_ctx1 = _mm256_permute4x64_epi64(base_ctx_zero, 0);
   __m256i ratez_dq0 = _mm256_shuffle_epi8(cost_dq0, base_ctx1);
   __m256i ratez_dq1 = _mm256_shuffle_epi8(cost_dq1, base_ctx1);
   __m256i ratez = _mm256_blend_epi16(ratez_dq0, ratez_dq1, 0xAA);
@@ -653,6 +677,17 @@ void av2_get_rate_dist_lf_luma_avx2(const struct tcq_param_t *p,
   __m128i c_zero = _mm256_castsi256_si128(zero);
   __m256i base_diag = _mm256_set1_epi8(base_diag_ctx);
   base_ctx = _mm256_add_epi8(base_ctx, base_diag);
+  // FIX (over-bound base_ctx): saturate each lane to LF_SIG_COEF_CONTEXTS-2.
+  // base_diag_ctx + (coef & 0xF) can reach 47, exceeding the array's
+  // LF_SIG_COEF_CONTEXTS = 33 in the second dimension. We clamp to (-2,
+  // not -1) because some loads in the loop below use the pattern
+  //   _mm_loadu_si64(&cost_low_tbl[idx][ctx][1])
+  // which is an 8-byte SIMD load that includes 4 spillover bytes from
+  // cost_low_tbl[idx][ctx+1][0]; that load requires ctx+1 in-bounds.
+  // The C reference uses the same clamp so both paths remain bit-exact.
+  __m256i base_ctx_max =
+      _mm256_set1_epi8((int8_t)(LF_SIG_COEF_CONTEXTS - 2));
+  base_ctx = _mm256_min_epu8(base_ctx, base_ctx_max);
   for (int i = 0; i < (TCQ_N_STATES >> 2); i++) {
     int ctx0 = _mm256_extract_epi8(base_ctx, 0);
     int ctx1 = _mm256_extract_epi8(base_ctx, 1);
@@ -720,6 +755,13 @@ void av2_get_rate_dist_lf_luma_avx2(const struct tcq_param_t *p,
     mid_ctx = _mm256_srli_epi16(mid_ctx, 4);
     __m256i mid_diag = _mm256_set1_epi16(mid_diag_ctx);
     mid_ctx = _mm256_add_epi16(mid_ctx, mid_diag);
+    // FIX (over-bound mid_ctx): saturate to LF_LEVEL_CONTEXTS-2 so the
+    // 8-byte loads at &cost_mid_tbl[mid_idx][ctx][1] (which spill 4 bytes
+    // into [ctx+1][0]) stay in-bounds. Same -2 (not -1) reasoning as
+    // base_ctx above. Matches the C reference clamp.
+    __m256i mid_ctx_max =
+        _mm256_set1_epi16((int16_t)(LF_LEVEL_CONTEXTS - 2));
+    mid_ctx = _mm256_min_epu16(mid_ctx, mid_ctx_max);
     for (int i = 0; i < (TCQ_N_STATES >> 2); i++) {
       int ctx0 = _mm256_extract_epi16(mid_ctx, 0);
       int ctx1 = _mm256_extract_epi16(mid_ctx, 1);
