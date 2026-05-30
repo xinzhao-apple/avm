@@ -396,7 +396,7 @@ void av2_pre_quant_c(tran_low_t tqc, struct prequant_t *pqData,
   tran_low_t abs_tqc = abs(tqc);
 
   tran_low_t qIdx = (int)AVMMAX(
-      1, AVMMIN(((1 << 16) - 1),
+      1, AVMMIN(INT16_MAX,
                 ((int64_t)abs_tqc * quant_ptr[scan_pos != 0] + add) >> shift));
   pqData->qIdx = qIdx;
 
