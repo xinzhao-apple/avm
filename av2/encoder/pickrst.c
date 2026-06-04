@@ -2049,6 +2049,7 @@ static void gather_stats_wienerns(const RestorationTileLimits *limits,
   rui.cm = rsc->cm;
   // Calculate and save this RU's stats.
   RstUnitStats unit_stats;
+  memset(&unit_stats, 0, sizeof(unit_stats));
   RestUnitSearchInfo *rusi = &rsc->rusi[rest_unit_idx];
   unit_stats.real_sse = 0;
   if (!rusi->bru_unit_skipped) {
@@ -3796,7 +3797,7 @@ void av2_pick_filter_restoration(const YV12_BUFFER_CONFIG *src, AV2_COMP *cpi) {
   // left uninitialised when we reach copy_unit_info(...). This is not a
   // problem, as these elements are ignored later, but in order to quiet
   // Valgrind's warnings we initialise the array below.
-  memset(rusi, 0, sizeof(*rusi) * ntiles[0]);
+  memset(rusi, 0, sizeof(*rusi) * max_ntile);
   x->rdmult = cpi->rd.RDMULT;
 
   Vector unit_stack;
