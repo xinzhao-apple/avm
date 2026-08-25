@@ -2960,7 +2960,8 @@ static INLINE void accumulate_partition_timing_stats(
 
 static AVM_INLINE void init_allowed_partitions(
     PartitionSearchState *part_search_state, const PartitionCfg *part_cfg,
-    const int bru_skip, const bool *partition_allowed) {
+    const int bru_skip, const bool *partition_allowed,
+    const int must_find_valid_partition) {
   const PartitionBlkParams *blk_params = &part_search_state->part_blk_params;
   const BLOCK_SIZE bsize = blk_params->bsize;
   if (bru_skip) {
@@ -2975,7 +2976,19 @@ static AVM_INLINE void init_allowed_partitions(
 #endif  // CONFIG_ML_PART_SPLIT
     return;
   }
+  // enable_rect_partitions is an encoder search restriction, not a bitstream
+  // constraint. Honouring it unconditionally can leave a block with no
+  // searchable partition at all: rect is off, square split is only eligible
+  // for 128x128/256x256, the extended (3-way/4-way) partitions bail out early
+  // when do_rectangular_split is 0, and PARTITION_NONE can still fail to
+  // produce a valid mode. In that case the superblock search finds nothing,
+  // must_find_valid_partition is set and the search is retried -- but the
+  // retry re-applied the same restriction, so it failed identically and
+  // tripped the "recoded twice" internal error. Treat the flag as a
+  // preference the validity fallback may override, exactly as the existing
+  // partial-boundary condition already does.
   const bool allow_rect = part_cfg->enable_rect_partitions ||
+                          must_find_valid_partition ||
                           !(blk_params->has_rows && blk_params->has_cols);
   const int min_partition_size = (blk_params->has_rows && blk_params->has_cols)
                                      ? blk_params->min_partition_size
@@ -3149,7 +3162,7 @@ static void init_partition_search_state_params(
   init_allowed_partitions(
       part_search_state, &cpi->oxcf.part_cfg,
       is_bru_not_active_and_not_on_partial_border(cm, mi_col, mi_row, bsize),
-      partition_allowed);
+      partition_allowed, x->must_find_valid_partition);
 
   if (max_recursion_depth == 0) {
     part_search_state->prune_rect_part[HORZ] =
@@ -5732,7 +5745,7 @@ BEGIN_PARTITION_SEARCH:
     init_allowed_partitions(
         &part_search_state, &cpi->oxcf.part_cfg,
         is_bru_not_active_and_not_on_partial_border(cm, mi_col, mi_row, bsize),
-        partition_allowed);
+        partition_allowed, x->must_find_valid_partition);
 #if CONFIG_ML_PART_SPLIT
     part_search_state.prune_rect_part[HORZ] = 0;
     part_search_state.prune_rect_part[VERT] = 0;
