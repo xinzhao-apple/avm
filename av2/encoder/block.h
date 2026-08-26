@@ -1503,6 +1503,16 @@ typedef struct macroblock {
    * recode the superblock again.
    */
   int must_find_valid_partition;
+
+  /*! \brief Whether to search all legal modes for the current block.
+   *
+   * Set only when PARTITION_NONE is the only partition type the encoder can
+   * search for a block (see is_none_the_only_searchable_partition()) and its
+   * first, fully speed-optimized mode search found nothing. There is no other
+   * partition to fall back on, so mode pruning is disabled for one retry to
+   * guarantee that at least one codable mode is found.
+   */
+  int force_unpruned_mode_search;
   /**@}*/
 
   /*****************************************************************************

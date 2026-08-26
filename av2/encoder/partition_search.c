@@ -2960,8 +2960,7 @@ static INLINE void accumulate_partition_timing_stats(
 
 static AVM_INLINE void init_allowed_partitions(
     PartitionSearchState *part_search_state, const PartitionCfg *part_cfg,
-    const int bru_skip, const bool *partition_allowed,
-    const int must_find_valid_partition) {
+    const int bru_skip, const bool *partition_allowed) {
   const PartitionBlkParams *blk_params = &part_search_state->part_blk_params;
   const BLOCK_SIZE bsize = blk_params->bsize;
   if (bru_skip) {
@@ -2976,19 +2975,7 @@ static AVM_INLINE void init_allowed_partitions(
 #endif  // CONFIG_ML_PART_SPLIT
     return;
   }
-  // enable_rect_partitions is an encoder search restriction, not a bitstream
-  // constraint. Honouring it unconditionally can leave a block with no
-  // searchable partition at all: rect is off, square split is only eligible
-  // for 128x128/256x256, the extended (3-way/4-way) partitions bail out early
-  // when do_rectangular_split is 0, and PARTITION_NONE can still fail to
-  // produce a valid mode. In that case the superblock search finds nothing,
-  // must_find_valid_partition is set and the search is retried -- but the
-  // retry re-applied the same restriction, so it failed identically and
-  // tripped the "recoded twice" internal error. Treat the flag as a
-  // preference the validity fallback may override, exactly as the existing
-  // partial-boundary condition already does.
   const bool allow_rect = part_cfg->enable_rect_partitions ||
-                          must_find_valid_partition ||
                           !(blk_params->has_rows && blk_params->has_cols);
   const int min_partition_size = (blk_params->has_rows && blk_params->has_cols)
                                      ? blk_params->min_partition_size
@@ -3162,7 +3149,7 @@ static void init_partition_search_state_params(
   init_allowed_partitions(
       part_search_state, &cpi->oxcf.part_cfg,
       is_bru_not_active_and_not_on_partial_border(cm, mi_col, mi_row, bsize),
-      partition_allowed, x->must_find_valid_partition);
+      partition_allowed);
 
   if (max_recursion_depth == 0) {
     part_search_state->prune_rect_part[HORZ] =
@@ -3724,6 +3711,56 @@ static void inter_sdp_copy_luma_mode_info(PC_TREE *pc_tree,
   *mbmi = cur_pc_tree->none[INTRA_REGION]->mic;
 }
 
+// Returns true if PARTITION_NONE is the only partition type the encoder is able
+// to search for this block, i.e. there is no fallback if its mode search fails.
+// Mirrors the gating in split_partition_search() and search_extended_partition()
+// so that this stays in sync with what the search actually attempts.
+static AVM_INLINE bool is_none_the_only_searchable_partition(
+    const PartitionSearchState *part_search_state, const AV2_COMP *const cpi,
+    const PartitionBlkParams blk_params) {
+  const AV2_COMMON *const cm = &cpi->common;
+  const BLOCK_SIZE bsize = blk_params.bsize;
+
+  if (!part_search_state->partition_none_allowed) return false;
+
+  // Rectangular partitions. These are additionally gated on an active edge,
+  // matching is_rect_part_allowed().
+  if (part_search_state->partition_rect_allowed[HORZ] &&
+      (part_search_state->do_rectangular_split ||
+       av2_active_h_edge(cpi, blk_params.mi_row, blk_params.mi_step_h)))
+    return false;
+  if (part_search_state->partition_rect_allowed[VERT] &&
+      (part_search_state->do_rectangular_split ||
+       av2_active_v_edge(cpi, blk_params.mi_col, blk_params.mi_step_w)))
+    return false;
+
+  // Square split, only eligible for the largest block sizes.
+  if (part_search_state->partition_split_allowed &&
+      is_square_split_eligible(bsize, cm->sb_size))
+    return false;
+
+  // Extended (3-way / 4-way) partitions. search_extended_partition() returns
+  // early unless do_rectangular_split is set or the block is on an active edge.
+  const bool ext_h_searchable =
+      part_search_state->do_rectangular_split ||
+      av2_active_h_edge(cpi, blk_params.mi_row, blk_params.mi_step_h);
+  const bool ext_v_searchable =
+      part_search_state->do_rectangular_split ||
+      av2_active_v_edge(cpi, blk_params.mi_col, blk_params.mi_step_w);
+  if (ext_h_searchable &&
+      (part_search_state->partition_3_allowed[HORZ] ||
+       part_search_state->partition_4a_allowed[HORZ] ||
+       part_search_state->partition_4b_allowed[HORZ]))
+    return false;
+  if (ext_v_searchable &&
+      (part_search_state->partition_3_allowed[VERT] ||
+       part_search_state->partition_4a_allowed[VERT] ||
+       part_search_state->partition_4b_allowed[VERT]))
+    return false;
+
+  return true;
+}
+
 // PARTITION_NONE search.
 static void none_partition_search(
     AV2_COMP *const cpi, ThreadData *td, TileDataEnc *tile_data, MACROBLOCK *x,
@@ -3809,6 +3846,40 @@ static void none_partition_search(
   pick_sb_modes(cpi, td, tile_data, x, mi_row, mi_col, this_rdc, PARTITION_NONE,
                 pc_tree->region_type, pc_tree->sb_root_partition_info, bsize,
                 ctx_none, best_remain_rdcost);
+
+  // If PARTITION_NONE is the only partition type this block can search, then a
+  // failed mode search here leaves the block -- and hence the whole superblock
+  // -- with no codable result at all, which aborts the encode. This happens
+  // when enable_rect_partitions is 0: HORZ/VERT are off, the extended
+  // partitions bail out with do_rectangular_split == 0, and PARTITION_SPLIT is
+  // only eligible for 128x128/256x256, so e.g. a 64x64 has nowhere else to go.
+  // The mode search itself is not out of legal modes; the speed features have
+  // simply pruned all of them. Retry once with pruning disabled so that at
+  // least one codable mode is guaranteed. The fast path above runs first and is
+  // kept whenever it succeeds, so this costs nothing in the common case.
+  // enable_rect_partitions == 0 is the only configuration that can leave a
+  // block without a working fallback, so scope the retry to it: with rect on,
+  // behaviour is bit-identical. Fire either when this block has no other
+  // searchable partition at all, or when we are already on the recode pass,
+  // where the alternatives have been tried and failed and NONE is the last
+  // resort before the encoder gives up on the superblock.
+  const bool none_is_last_resort =
+      !cpi->oxcf.part_cfg.enable_rect_partitions &&
+      (x->must_find_valid_partition ||
+       is_none_the_only_searchable_partition(part_search_state, cpi,
+                                             blk_params));
+  if (this_rdc->rate == INT_MAX && none_is_last_resort) {
+    assert(!x->force_unpruned_mode_search);
+    x->force_unpruned_mode_search = 1;
+    av2_restore_context(cm, x, x_ctx, mi_row, mi_col, bsize,
+                        av2_num_planes(cm));
+    ctx_none->rd_mode_is_ready = 0;
+    pick_sb_modes(cpi, td, tile_data, x, mi_row, mi_col, this_rdc,
+                  PARTITION_NONE, pc_tree->region_type,
+                  pc_tree->sb_root_partition_info, bsize, ctx_none,
+                  best_remain_rdcost);
+    x->force_unpruned_mode_search = 0;
+  }
 
   for (int k = 0; k < NUMBER_OF_CACHED_MODES; k++) {
     x->inter_mode_cache[k] = NULL;
@@ -5745,7 +5816,7 @@ BEGIN_PARTITION_SEARCH:
     init_allowed_partitions(
         &part_search_state, &cpi->oxcf.part_cfg,
         is_bru_not_active_and_not_on_partial_border(cm, mi_col, mi_row, bsize),
-        partition_allowed, x->must_find_valid_partition);
+        partition_allowed);
 #if CONFIG_ML_PART_SPLIT
     part_search_state.prune_rect_part[HORZ] = 0;
     part_search_state.prune_rect_part[VERT] = 0;

@@ -7283,6 +7283,10 @@ static int inter_mode_search_order_independent_skip(
     const AV2_COMP *cpi, MACROBLOCK *x, mode_skip_mask_t *mode_skip_mask,
     InterModeSearchState *search_state, uint64_t skip_ref_frame_mask,
     PREDICTION_MODE mode, const MV_REFERENCE_FRAME *ref_frame) {
+  // When PARTITION_NONE is the only partition the encoder can search for this
+  // block, a fully pruned mode search leaves it with no codable mode and no
+  // fallback partition. In that case only, search every legal mode.
+  if (x->force_unpruned_mode_search) return 0;
   if (mask_says_skip(mode_skip_mask, ref_frame, mode)) {
     return 1;
   }
@@ -8244,6 +8248,7 @@ static void av2_evaluate_intra_modes_in_inter_frame(
   // Gate intra mode evaluation if best of inter is skip except when source
   // variance is extremely low
   if (sf->intra_sf.skip_intra_in_interframe &&
+      !x->force_unpruned_mode_search &&
       (x->source_variance > sf->intra_sf.src_var_thresh_intra_skip)) {
     if (inter_cost >= 0 && intra_cost >= 0) {
       avm_clear_system_state();
